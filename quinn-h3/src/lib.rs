@@ -185,6 +185,14 @@ impl Error {
     {
         Self::Body(Box::new(err))
     }
+
+    /// Get the error reason if it's an `HttpError`
+    pub fn reason(&self) -> Option<HttpError> {
+        match self {
+            Error::Http(http, _) => Some((*http).clone()),
+            _ => None,
+        }
+    }
 }
 
 impl From<proto::connection::Error> for Error {
@@ -266,7 +274,7 @@ impl From<proto::headers::Error> for Error {
 /// Read the [HTTP/3 specification] for more details.
 ///
 /// [HTTP/3 specification]: https://quicwg.org/base-drafts/draft-ietf-quic-http.html#name-http-3-error-codes
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum HttpError {
     /// This is used when the connection or stream needs to be closed, but there is no error to signal
     NoError,
