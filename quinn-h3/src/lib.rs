@@ -274,7 +274,7 @@ impl From<proto::headers::Error> for Error {
 /// Read the [HTTP/3 specification] for more details.
 ///
 /// [HTTP/3 specification]: https://quicwg.org/base-drafts/draft-ietf-quic-http.html#name-http-3-error-codes
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum HttpError {
     /// This is used when the connection or stream needs to be closed, but there is no error to signal
     NoError,
