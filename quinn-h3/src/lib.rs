@@ -86,6 +86,7 @@ extern crate assert_matches;
 mod tests;
 
 pub use body::{BodyReader, BodyWriter, IntoBody, SimpleBody};
+pub use data::SendData;
 pub use proto::settings::Settings;
 
 pub mod client;
@@ -93,6 +94,7 @@ pub mod server;
 
 mod body;
 mod connection;
+mod data;
 mod frame;
 mod headers;
 mod proto;

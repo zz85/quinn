@@ -21,7 +21,7 @@ use tracing::{error, info, info_span};
 use tracing_futures::Instrument as _;
 
 use quinn::SendStream;
-use quinn_h3::{self, server::RecvRequest};
+use quinn_h3::{self, server::RecvRequest, IntoBody};
 use sync::Arc;
 
 #[derive(StructOpt, Debug, Clone)]
@@ -166,7 +166,7 @@ async fn h3_home(sender: quinn_h3::server::Sender) -> Result<()> {
     let response = Response::builder()
         .status(StatusCode::OK)
         .header("server", VERSION)
-        .body(HOME)
+        .body(HOME.into_body())
         .expect("failed to build response");
     sender
         .send_response(response)
@@ -180,7 +180,7 @@ async fn h3_payload(sender: quinn_h3::server::Sender, len: usize) -> Result<()> 
         let response = Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .header("server", VERSION)
-            .body(Bytes::from(format!("requested {}: too large", len)))
+            .body(format!("requested {}: too large", len).into_body())
             .expect("failed to build response");
         sender.send_response(response).await?;
         return Ok(());
@@ -192,7 +192,7 @@ async fn h3_payload(sender: quinn_h3::server::Sender, len: usize) -> Result<()> 
     let response = Response::builder()
         .status(StatusCode::OK)
         .header("server", VERSION)
-        .body(Bytes::from(buf))
+        .body(buf.into_body())
         .expect("failed to build response");
 
     sender
