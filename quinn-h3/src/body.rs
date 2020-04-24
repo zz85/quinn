@@ -174,7 +174,7 @@ impl BodyReader {
     ///
     /// The peer will receive a request error with `REQUEST_CANCELLED` code.
     pub fn cancel(mut self) {
-        if let Some(recv) = self.recv.take() {
+        if let Some(mut recv) = self.recv.take() {
             recv.reset(ErrorCode::REQUEST_CANCELLED);
         }
     }
@@ -395,7 +395,7 @@ impl BodyWriter {
             BodyWriterState::Idle(mut send) => {
                 send.reset(ErrorCode::REQUEST_CANCELLED.into());
             }
-            BodyWriterState::Writing(write) => {
+            BodyWriterState::Writing(mut write) => {
                 write.reset(ErrorCode::REQUEST_CANCELLED);
             }
             _ => (),
