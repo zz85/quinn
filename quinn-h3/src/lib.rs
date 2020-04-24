@@ -85,7 +85,7 @@ extern crate assert_matches;
 #[cfg(test)]
 mod tests;
 
-pub use body::{Body, BodyReader, BodyWriter};
+pub use body::{BodyReader, BodyWriter, IntoBody, SimpleBody};
 pub use proto::settings::Settings;
 
 pub mod client;

@@ -30,6 +30,7 @@ use crate::{
     streams::Reset,
     Error,
 };
+use http_body::Body as HttpBody;
 
 /// Simple body representation
 ///
@@ -503,5 +504,87 @@ impl Drop for BodyWriter {
                 .inner
                 .request_finished(self.stream_id);
         }
+    }
+}
+
+/// Helper struct to build HttpBody from simple types
+///
+/// This is inteded to be used to build [`Request`] and [`Response`] with a body
+/// which conversion to [`Bytes`] is trivial.
+///
+/// You'll need to use [`IntoBody`] trait to build from a type:
+///
+/// ```
+/// use http::{Response, StatusCode};
+/// use quinn_h3::{IntoBody, SimpleBody};
+///
+/// // Type specification isn't needed, it's here for demonstration.
+/// let body: SimpleBody<Bytes> = b"Greetings over HTTP/3".into_body();
+/// let response = Response::builder()
+///     .status(StatusCode::OK)
+///     .header("response", "header")
+///     .body(body)?;
+/// ```
+///
+/// [`Request`]: https://docs.rs/http/*/http/request/index.html
+/// [`Response`]: https://docs.rs/http/*/http/response/index.html
+/// [`Bytes`]: https://docs.rs/bytes/*/bytes/bytes/index.html
+/// [`IntoBody`]: trait.IntoBody.html
+pub struct SimpleBody<T> {
+    inner: Option<T>,
+}
+
+impl<T> SimpleBody<T> {
+    /// Create an empty body
+    pub fn empty() -> SimpleBody<T> {
+        Self { inner: None }
+    }
+}
+
+/// Create an `HttpBody` from a simple type
+pub trait IntoBody<T> {
+    /// Convert one type to a `SimpleBody`, `HttpBody` implementation
+    fn into_body(self) -> SimpleBody<T>;
+}
+
+impl IntoBody<Bytes> for Bytes {
+    fn into_body(self) -> SimpleBody<Bytes> {
+        SimpleBody { inner: Some(self) }
+    }
+}
+
+impl IntoBody<Bytes> for &str {
+    fn into_body(self) -> SimpleBody<Bytes> {
+        SimpleBody {
+            inner: Some(Bytes::copy_from_slice(self.as_ref())),
+        }
+    }
+}
+
+impl IntoBody<Bytes> for &[u8] {
+    fn into_body(self) -> SimpleBody<Bytes> {
+        SimpleBody {
+            inner: Some(Bytes::copy_from_slice(self)),
+        }
+    }
+}
+
+impl HttpBody for SimpleBody<Bytes> {
+    type Data = Bytes;
+    type Error = ();
+    fn poll_data(
+        mut self: Pin<&mut Self>,
+        _: &mut Context,
+    ) -> Poll<Option<Result<Self::Data, Self::Error>>> {
+        match self.inner.take() {
+            Some(b) => Poll::Ready(Some(Ok(b))),
+            None => Poll::Ready(None),
+        }
+    }
+    fn poll_trailers(
+        self: Pin<&mut Self>,
+        _: &mut Context,
+    ) -> Poll<Result<Option<HeaderMap>, Self::Error>> {
+        Poll::Ready(Ok(None))
     }
 }
