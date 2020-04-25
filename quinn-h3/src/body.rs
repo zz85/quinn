@@ -30,40 +30,6 @@ use crate::{
     streams::Reset,
     Error,
 };
-use http_body::Body as HttpBody;
-
-/// Simple body representation
-///
-/// It is intended to be constructed from common types such as `&str`, and be passed
-/// to [`http::Request<B>`] or [`http::Response<B>`] as the B parameter. It's is intended
-/// as a convenient way to send simple and small bodies.
-///
-/// [`http::Request<B>`]: https://docs.rs/http/*/http/request/index.html
-/// [`http::Response<B>`]: https://docs.rs/http/*/http/response/index.html
-pub enum Body {
-    /// Inexistent body
-    None,
-    /// Buffer-contained body
-    Buf(Bytes),
-}
-
-impl From<()> for Body {
-    fn from(_: ()) -> Self {
-        Body::None
-    }
-}
-
-impl From<Bytes> for Body {
-    fn from(buf: Bytes) -> Self {
-        Body::Buf(buf)
-    }
-}
-
-impl From<&str> for Body {
-    fn from(buf: &str) -> Self {
-        Body::Buf(Bytes::copy_from_slice(buf.as_ref()))
-    }
-}
 
 /// Read the body of a request or response
 ///
