@@ -68,6 +68,7 @@
 #![allow(clippy::needless_doctest_main)]
 
 use std::{
+    any::Any,
     future::Future,
     mem,
     net::SocketAddr,
@@ -75,25 +76,21 @@ use std::{
     task::{Context, Poll},
 };
 
-use futures::{ready, Stream};
+use futures::{channel::oneshot, ready, FutureExt, Stream};
 use http::{request, Request, Response};
-use quinn::{Certificate, Endpoint};
+use http_body::Body;
+use quinn::{Certificate, Endpoint, OpenBi, RecvStream};
 use quinn_proto::{Side, StreamId};
 use tracing::trace;
 
 use crate::{
-    body::{Body, BodyReader, BodyWriter},
+    body::BodyReader,
     connection::{ConnectionDriver, ConnectionRef},
-    frame::{FrameDecoder, FrameStream, WriteFrame},
-    headers::{DecodeHeaders, SendHeaders},
-    proto::{
-        frame::{DataFrame, HttpFrame},
-        headers::Header,
-        settings::Settings,
-        ErrorCode,
-    },
+    frame::{FrameDecoder, FrameStream},
+    headers::DecodeHeaders,
+    proto::{frame::HttpFrame, headers::Header, settings::Settings, ErrorCode},
     streams::Reset,
-    Error, ZeroRttAccepted,
+    Error, SendData, ZeroRttAccepted,
 };
 
 /// Configure and build a new HTTP/3 client
@@ -484,46 +481,17 @@ impl Connection {
     /// [`BodyWriter`]: ../struct.BodyWriter.html
     /// [`AsyncWrite`]: https://docs.rs/futures/*/futures/io/trait.AsyncWrite.html
     /// [`Into<Body>`]: ../struct.Body.html
-    pub async fn send_request<T: Into<Body>>(
-        &self,
-        request: Request<T>,
-    ) -> Result<(RecvResponse, BodyWriter), Error> {
-        let (request, body) = request.into_parts();
-        let request::Parts {
-            method,
-            uri,
-            headers,
-            ..
-        } = request;
-        let (send, recv) = self.0.quic.open_bi().await?;
+    pub fn send_request<B>(&self, request: Request<B>) -> (SendRequest<B, B::Data>, RecvResponse)
+    where
+        B: Body + Unpin,
+        B::Data: Unpin,
+        B::Error: std::fmt::Debug + Any + Send + Sync,
+    {
+        let (open_send, open_recv) = oneshot::channel();
+        let recv = RecvResponse::new(open_recv, self.0.clone());
+        let send = SendRequest::new(open_send, self.0.clone(), request);
 
-        if recv.is_0rtt() && !method.is_idempotent() {
-            return Err(Error::internal("non-idempotent method tried on 0RTT"));
-        }
-
-        let stream_id = send.id();
-        let send = SendHeaders::new(
-            Header::request(method, uri, headers),
-            &self.0,
-            send,
-            stream_id,
-        )?
-        .await?;
-
-        let recv = RecvResponse::new(FrameDecoder::stream(recv), self.0.clone(), stream_id);
-        match body.into() {
-            Body::Buf(payload) => {
-                let send: WriteFrame<DataFrame<_>> = WriteFrame::new(send, DataFrame { payload });
-                Ok((
-                    recv,
-                    BodyWriter::new(send.await?, self.0.clone(), stream_id, false),
-                ))
-            }
-            Body::None => Ok((
-                recv,
-                BodyWriter::new(send, self.0.clone(), stream_id, false),
-            )),
-        }
+        (send, recv)
     }
 
     /// Close the connection immediately
@@ -548,6 +516,89 @@ impl Drop for Connection {
         self.0
             .quic
             .close(ErrorCode::NO_ERROR.into(), b"Connection closed");
+    }
+}
+
+/// Send a request
+pub struct SendRequest<B, D> {
+    conn: ConnectionRef,
+    request: Option<Request<B>>,
+    state: SendRequestState<B, D>,
+    open: OpenBi,
+    chan: Option<oneshot::Sender<(RecvStream, StreamId)>>,
+}
+
+impl<B, D> SendRequest<B, D> {
+    pub(crate) fn new(
+        open_send: oneshot::Sender<(RecvStream, StreamId)>,
+        conn: ConnectionRef,
+        request: Request<B>,
+    ) -> Self {
+        let open = conn.quic.open_bi();
+        Self {
+            conn,
+            open,
+            chan: Some(open_send),
+            request: Some(request),
+            state: SendRequestState::Opening,
+        }
+    }
+}
+
+enum SendRequestState<B, D> {
+    Opening,
+    Sending(SendData<B, D>),
+}
+
+impl<B> Future for SendRequest<B, B::Data>
+where
+    B: Body + Unpin,
+    B::Data: Unpin,
+    B::Error: std::fmt::Debug + Any + Send + Sync,
+{
+    type Output = Result<(), Error>;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        loop {
+            match self.state {
+                SendRequestState::Opening => {
+                    match ready!(self.open.poll_unpin(cx)) {
+                        Err(e) => {
+                            self.chan.take().unwrap(); // drop it so RecvResponse fails
+                            return Poll::Ready(Err(e.into()));
+                        }
+                        Ok((send, recv)) => {
+                            let (parts, body) = self.request.take().unwrap().into_parts();
+                            let request::Parts {
+                                method,
+                                uri,
+                                headers,
+                                ..
+                            } = parts;
+
+                            if recv.is_0rtt() && !method.is_idempotent() {
+                                let err = Error::internal("non-idempotent method tried on 0RTT");
+                                self.chan.take().unwrap(); // drop it so RecvResponse fails
+                                return Poll::Ready(Err(err));
+                            }
+
+                            self.chan
+                                .take()
+                                .unwrap()
+                                .send((recv, send.id()))
+                                .map_err(|_| Error::internal("SendRequest chan cancelled"))?;
+
+                            let header = Header::request(method, uri, headers);
+                            let send = SendData::new(send, self.conn.clone(), header, body);
+                            self.state = SendRequestState::Sending(send);
+                        }
+                    }
+                }
+                SendRequestState::Sending(ref mut send) => {
+                    ready!(send.poll_unpin(cx))?;
+                    return Poll::Ready(Ok(()));
+                }
+            }
+        }
     }
 }
 
@@ -589,23 +640,27 @@ impl Drop for Connection {
 pub struct RecvResponse {
     state: RecvResponseState,
     conn: ConnectionRef,
-    stream_id: StreamId,
+    stream_id: Option<StreamId>,
     recv: Option<FrameStream>,
 }
 
 enum RecvResponseState {
+    Opening(oneshot::Receiver<(RecvStream, StreamId)>),
     Receiving(FrameStream),
     Decoding(DecodeHeaders),
     Finished,
 }
 
 impl RecvResponse {
-    pub(crate) fn new(recv: FrameStream, conn: ConnectionRef, stream_id: StreamId) -> Self {
+    pub(crate) fn new(
+        recv: oneshot::Receiver<(RecvStream, StreamId)>,
+        conn: ConnectionRef,
+    ) -> Self {
         Self {
             conn,
-            stream_id,
             recv: None,
-            state: RecvResponseState::Receiving(recv),
+            state: RecvResponseState::Opening(recv),
+            stream_id: None,
         }
     }
 
@@ -619,7 +674,11 @@ impl RecvResponse {
             RecvResponseState::Decoding(_) => self.recv.take().expect("cancel recv"),
             _ => return,
         };
-        self.conn.h3.lock().unwrap().cancel_request(self.stream_id);
+        self.conn
+            .h3
+            .lock()
+            .unwrap()
+            .cancel_request(self.stream_id.unwrap());
         recv.reset(ErrorCode::REQUEST_CANCELLED);
     }
 }
@@ -635,6 +694,12 @@ impl Future for RecvResponse {
                         "recv response polled after finish",
                     )))
                 }
+                RecvResponseState::Opening(ref mut open) => {
+                    let (recv, id) = ready!(open.poll_unpin(cx))
+                        .map_err(|_| Error::internal("RecvResponse channel cancelled"))?;
+                    self.stream_id = Some(id);
+                    self.state = RecvResponseState::Receiving(FrameDecoder::stream(recv));
+                }
                 RecvResponseState::Receiving(ref mut recv) => {
                     let frame = ready!(Pin::new(recv).poll_next(cx));
 
@@ -645,8 +710,11 @@ impl Future for RecvResponse {
                         Some(Ok(f)) => match f {
                             HttpFrame::Reserved => (),
                             HttpFrame::Headers(h) => {
-                                let decode =
-                                    DecodeHeaders::new(h, self.conn.clone(), self.stream_id);
+                                let decode = DecodeHeaders::new(
+                                    h,
+                                    self.conn.clone(),
+                                    self.stream_id.unwrap(),
+                                );
                                 match mem::replace(
                                     &mut self.state,
                                     RecvResponseState::Decoding(decode),
@@ -679,7 +747,7 @@ impl Future for RecvResponse {
                                 BodyReader::new(
                                     self.recv.take().unwrap(),
                                     self.conn.clone(),
-                                    self.stream_id,
+                                    self.stream_id.unwrap(),
                                     true,
                                 ),
                             )));
