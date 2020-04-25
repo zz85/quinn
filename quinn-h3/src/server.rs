@@ -129,7 +129,11 @@ use crate::{
     data::SendData,
     frame::{FrameDecoder, FrameStream},
     headers::DecodeHeaders,
-    proto::{frame::HttpFrame, headers::Header, ErrorCode},
+    proto::{
+        frame::HttpFrame,
+        headers::Header,
+        ErrorCode,
+    },
     streams::Reset,
     Error, Settings,
 };
