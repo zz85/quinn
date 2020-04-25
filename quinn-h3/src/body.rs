@@ -1,22 +1,24 @@
 use std::{
-    cmp,
+    cmp, fmt,
+    future::Future,
     io::{self, ErrorKind},
     mem,
     pin::Pin,
     task::{Context, Poll},
 };
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use futures::{
+    future,
     io::{AsyncRead, AsyncWrite},
     ready,
     stream::Stream,
     FutureExt,
 };
 use http::HeaderMap;
+use http_body::Body as HttpBody;
 use quinn::SendStream;
 use quinn_proto::StreamId;
-use std::future::Future;
 
 use crate::{
     connection::ConnectionRef,
@@ -552,5 +554,102 @@ impl HttpBody for SimpleBody<Bytes> {
         _: &mut Context,
     ) -> Poll<Result<Option<HeaderMap>, Self::Error>> {
         Poll::Ready(Ok(None))
+    }
+}
+
+pub struct RecvBody {
+    conn: ConnectionRef,
+    stream_id: StreamId,
+    recv: FrameStream,
+    trailers: Option<HeadersFrame>,
+}
+
+impl RecvBody {
+    pub(crate) fn new(conn: ConnectionRef, stream_id: StreamId, recv: FrameStream) -> Self {
+        Self {
+            conn,
+            stream_id,
+            recv,
+            trailers: None,
+        }
+    }
+
+    pub async fn read_to_end(&mut self) -> Result<Bytes, Error> {
+        let mut body = BytesMut::with_capacity(10_240);
+
+        let mut me = self;
+        let res: Result<(), Error> = future::poll_fn(|cx| {
+            while let Some(d) = ready!(Pin::new(&mut me).poll_data(cx)) {
+                body.extend(d?.bytes());
+            }
+            Poll::Ready(Ok(()))
+        })
+        .await;
+        res?;
+
+        Ok(body.freeze())
+    }
+
+    pub async fn trailers(&mut self) -> Result<Option<HeaderMap>, Error> {
+        let mut me = self;
+        Ok(future::poll_fn(|cx| Pin::new(&mut me).poll_trailers(cx)).await?)
+    }
+}
+
+impl HttpBody for RecvBody {
+    type Data = bytes::Bytes;
+    type Error = Error;
+
+    fn poll_data(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Self::Data, Self::Error>>> {
+        loop {
+            return match ready!(Pin::new(&mut self.recv).poll_next(cx)) {
+                None => Poll::Ready(None),
+                Some(Ok(HttpFrame::Reserved)) => continue,
+                Some(Ok(HttpFrame::Data(d))) => Poll::Ready(Some(Ok(d.payload))),
+                Some(Ok(HttpFrame::Headers(t))) => {
+                    self.trailers = Some(t);
+                    Poll::Ready(None)
+                }
+                Some(Err(e)) => {
+                    self.recv.reset(e.code());
+                    Poll::Ready(Some(Err(e.into())))
+                }
+                Some(Ok(f)) => {
+                    self.recv.reset(ErrorCode::FRAME_UNEXPECTED);
+                    Poll::Ready(Some(Err(Error::Peer(format!(
+                        "Invalid frame type in body: {:?}",
+                        f
+                    )))))
+                }
+            };
+        }
+    }
+
+    fn poll_trailers(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<http::HeaderMap>, Self::Error>> {
+        if self.trailers.is_none() {
+            return Poll::Ready(Ok(None));
+        }
+
+        let header = {
+            let mut conn = self.conn.h3.lock().unwrap();
+            ready!(conn.poll_decode(cx, self.stream_id, self.trailers.as_ref().unwrap()))?
+        };
+        self.trailers = None;
+
+        Poll::Ready(Ok(Some(header.into_fields())))
+    }
+}
+
+impl fmt::Debug for RecvBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RecvBody")
+            .field("stream", &self.stream_id)
+            .finish()
     }
 }
