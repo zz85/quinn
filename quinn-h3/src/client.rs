@@ -528,7 +528,12 @@ pub struct SendRequest<B, D> {
     chan: Option<oneshot::Sender<(RecvStream, StreamId)>>,
 }
 
-impl<B, D> SendRequest<B, D> {
+impl<B> SendRequest<B, B::Data>
+where
+    B: Body + Unpin,
+    B::Data: Unpin,
+    B::Error: std::fmt::Debug + Any + Send + Sync,
+{
     pub(crate) fn new(
         open_send: oneshot::Sender<(RecvStream, StreamId)>,
         conn: ConnectionRef,
@@ -541,6 +546,18 @@ impl<B, D> SendRequest<B, D> {
             chan: Some(open_send),
             request: Some(request),
             state: SendRequestState::Opening,
+        }
+    }
+
+    /// Cancel the request
+    ///
+    /// The peer will receive a request error with `REQUEST_CANCELLED` code.
+    pub fn cancel(&mut self) {
+        match self.state {
+            SendRequestState::Sending(ref mut send) => {
+                send.cancel();
+            }
+            _ => (),
         }
     }
 }

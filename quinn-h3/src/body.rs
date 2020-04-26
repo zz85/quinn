@@ -140,6 +140,10 @@ impl RecvBody {
         let mut me = self;
         Ok(future::poll_fn(|cx| Pin::new(&mut me).poll_trailers(cx)).await?)
     }
+
+    pub fn cancel(&mut self) {
+        self.recv.reset(ErrorCode::REQUEST_REJECTED);
+    }
 }
 
 impl HttpBody for RecvBody {
