@@ -7,6 +7,7 @@ use std::{
 
 use bytes::{Buf, BufMut, BytesMut};
 use futures::{ready, FutureExt};
+use pin_project::{pin_project, project};
 use quinn::{RecvStream, SendStream, VarInt};
 use tokio::io::AsyncRead;
 use tokio_util::codec::{Decoder, FramedRead};
@@ -103,8 +104,10 @@ impl Decoder for FrameDecoder {
     }
 }
 
+#[pin_project]
 pub(crate) struct WriteFrame<F> {
     state: WriteFrameState,
+    #[pin]
     send: Option<SendStream>,
     frame: F,
 }
@@ -143,48 +146,47 @@ where
 
 impl<F> Future for WriteFrame<F>
 where
-    F: FrameHeader + IntoPayload + Unpin,
+    F: FrameHeader + IntoPayload,
 {
     type Output = Result<SendStream, quinn::WriteError>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+    #[project]
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        let mut me = self.project();
         loop {
-            match self.state {
+            match me.state {
                 WriteFrameState::Finished => panic!("polled after finish"),
                 WriteFrameState::Header(h, mut start, len) => {
-                    let wrote = ready!(self
-                        .send
-                        .as_mut()
-                        .unwrap()
-                        .write(&h[start..len])
-                        .poll_unpin(cx))?;
+                    let mut send = me.send.as_mut();
+                    let send = (*send).as_mut().unwrap();
+                    let wrote = ready!(send.write(&h[start..*len]).poll_unpin(cx)?);
                     start += wrote;
 
-                    if start < len {
+                    if start < *len {
                         continue;
                     }
-                    self.state = WriteFrameState::Payload;
+                    *me.state = WriteFrameState::Payload;
                 }
                 WriteFrameState::Payload => {
-                    let mut send = self.send.take().unwrap();
-                    let p = self.frame.into_payload();
+                    let mut send = me.send.as_mut().take().unwrap();
+                    let p = me.frame.into_payload();
 
                     match send.write(p.bytes()).poll_unpin(cx) {
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                         Poll::Pending => {
-                            self.send = Some(send);
+                            me.send.set(Some(send));
                             return Poll::Pending;
                         }
                         Poll::Ready(Ok(wrote)) => {
                             p.advance(wrote);
                             if p.has_remaining() {
-                                self.send = Some(send);
+                                me.send.set(Some(send));
                                 continue;
                             }
                         }
                     }
 
-                    self.state = WriteFrameState::Finished;
+                    *me.state = WriteFrameState::Finished;
                     return Poll::Ready(Ok(send));
                 }
             }

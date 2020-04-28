@@ -85,7 +85,8 @@ extern crate assert_matches;
 #[cfg(test)]
 mod tests;
 
-pub use body::{IntoBody, SimpleBody};
+pub use body::{IntoBody, RecvBody, SimpleBody};
+pub use data::RecvData;
 pub use data::SendData;
 pub use proto::settings::Settings;
 
@@ -108,7 +109,7 @@ pub mod qpack;
 
 use err_derive::Error;
 use quinn::{ApplicationClose, ConnectionError, ReadError, WriteError};
-use std::{any::Any, fmt::Debug, io::ErrorKind};
+use std::{error::Error as StdError, fmt::Debug, io::ErrorKind};
 
 use proto::ErrorCode;
 
@@ -155,8 +156,8 @@ pub enum Error {
     #[error(display = "Http error: {:?}", _0)]
     Http(HttpError, Option<String>),
     /// Polling the issued body data yielded an error
-    #[error(display = "Polling body error: {:?}", _0)]
-    Body(Box<dyn Debug + Send + Sync>),
+    #[error(display = "Polling body error")]
+    Body(Box<dyn StdError + Send + Sync>),
 }
 
 impl Error {
@@ -179,11 +180,8 @@ impl Error {
         }
     }
 
-    pub(crate) fn body<T>(err: T) -> Self
-    where
-        T: Debug + Any + Send + Sync,
-    {
-        Self::Body(Box::new(err))
+    pub(crate) fn body(err: Box<dyn StdError + Send + Sync>) -> Self {
+        Self::Body(err)
     }
 
     /// Get the error reason if it's an `HttpError`

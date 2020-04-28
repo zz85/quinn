@@ -106,7 +106,7 @@
 #![allow(clippy::needless_doctest_main)]
 
 use std::{
-    any::Any,
+    error::Error as StdError,
     future::Future,
     net::{Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket},
     pin::Pin,
@@ -115,7 +115,7 @@ use std::{
 
 use futures::{ready, FutureExt, Stream};
 use http::{response, Request, Response};
-use http_body::Body;
+use http_body::Body as HttpBody;
 use quinn::{
     CertificateChain, EndpointBuilder, PrivateKey, RecvStream, SendStream, ZeroRttAccepted,
 };
@@ -626,8 +626,8 @@ impl Future for RecvRequest {
         let (header, body) = ready!(self.recv.as_mut().unwrap().poll_unpin(cx))?;
         let request = self.build_request(header, body)?;
         let sender = Sender {
-            send: self.send.take().unwrap(),
-            conn: self.conn.clone(),
+            send: self.send.take(),
+            conn: Some(self.conn.clone()),
         };
         Poll::Ready(Ok((request, sender)))
     }
@@ -649,8 +649,8 @@ impl Future for RecvRequest {
 /// [`BodyReader`]: ../body/struct.BodyReader.html
 /// [`cancel()`]: #method.cancel
 pub struct Sender {
-    send: SendStream,
-    conn: ConnectionRef,
+    send: Option<SendStream>,
+    conn: Option<ConnectionRef>,
 }
 
 impl Sender {
@@ -710,11 +710,11 @@ impl Sender {
     /// [`Body`]: ../enum.Body.html
     /// [`BodyWriter`]: ../struct.BodyWriter.html
     /// [`AsyncWrite`]: https://docs.rs/futures/*/futures/io/trait.AsyncWrite.html
-    pub fn send_response<B>(self, response: Response<B>) -> SendData<B, B::Data>
+    pub fn send_response<B>(&mut self, response: Response<B>) -> SendData<B, B::Data>
     where
-        B: Body + Unpin,
-        B::Data: Unpin,
-        B::Error: std::fmt::Debug + Any + Send + Sync, // TODO remove debug
+        B: HttpBody + Send + 'static,
+        B::Data: Send,
+        B::Error: Into<Box<dyn StdError + Send + Sync>> + Send + Sync, // TODO remove debug
     {
         let (response, body) = response.into_parts();
 
@@ -723,7 +723,8 @@ impl Sender {
         } = response;
         let header = Header::response(status, headers);
 
-        SendData::new(self.send, self.conn, header, body)
+        let (send, conn) = (self.send.take().unwrap(), self.conn.take().unwrap());
+        SendData::new(send, conn, header, body)
     }
 
     /// Cancel request processing
@@ -733,7 +734,10 @@ impl Sender {
     ///
     /// Cancelling a request means that some request data have been processed by the application, which
     /// decided to abandon the response.
-    pub fn cancel(mut self) {
-        self.send.reset(ErrorCode::REQUEST_CANCELLED.into());
+    pub fn cancel(&mut self) {
+        self.send
+            .as_mut()
+            .unwrap()
+            .reset(ErrorCode::REQUEST_CANCELLED.into());
     }
 }

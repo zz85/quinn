@@ -69,6 +69,7 @@
 
 use std::{
     any::Any,
+    error::Error as StdError,
     future::Future,
     net::SocketAddr,
     pin::Pin,
@@ -445,7 +446,7 @@ impl Connection {
     ///     let (response, mut body_reader) = recv_response.await?;
     ///     let mut body = String::new();
     ///     body_reader.read_to_string(&mut body).await?;
-    ///    
+    ///
     ///     Ok(())
     /// }
     /// ```
@@ -481,9 +482,9 @@ impl Connection {
     /// [`Into<Body>`]: ../struct.Body.html
     pub fn send_request<B>(&self, request: Request<B>) -> (SendRequest<B, B::Data>, RecvResponse)
     where
-        B: Body + Unpin,
+        B: Body + Unpin + 'static,
         B::Data: Unpin,
-        B::Error: std::fmt::Debug + Any + Send + Sync,
+        B::Error: Into<Box<dyn StdError + Send + Sync>> + Send + Sync,
     {
         let (open_send, open_recv) = oneshot::channel();
         let recv = RecvResponse::new(open_recv, self.0.clone());
@@ -528,9 +529,9 @@ pub struct SendRequest<B, D> {
 
 impl<B> SendRequest<B, B::Data>
 where
-    B: Body + Unpin,
+    B: Body + Unpin + 'static,
     B::Data: Unpin,
-    B::Error: std::fmt::Debug + Any + Send + Sync,
+    B::Error: Into<Box<dyn StdError + Send + Sync>> + Send + Sync,
 {
     pub(crate) fn new(
         open_send: oneshot::Sender<(RecvStream, StreamId)>,
@@ -567,9 +568,9 @@ enum SendRequestState<B, D> {
 
 impl<B> Future for SendRequest<B, B::Data>
 where
-    B: Body + Unpin,
+    B: Body + Unpin + 'static,
     B::Data: Unpin,
-    B::Error: std::fmt::Debug + Any + Send + Sync,
+    B::Error: Into<Box<dyn StdError + Send + Sync>> + Any + Send + Sync,
 {
     type Output = Result<(), Error>;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
