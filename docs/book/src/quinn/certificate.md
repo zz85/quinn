@@ -31,7 +31,7 @@ impl rustls::ServerCertVerifier for SkipCertificationVerification {
 }
 ```
 
-After that, modify the [ClientConfig][ClientConfig] to use this [ServerCertVerifier][ServerCertVerifier] implementation. 
+After that, we can configure our [ClientConfig][ClientConfig] to use this new [ServerCertVerifier][ServerCertVerifier] implementation. 
 
 ```rust
 pub fn insecure() -> ClientConfig {
