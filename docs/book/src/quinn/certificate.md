@@ -2,7 +2,8 @@
 
 In this chapter, we discuss the configuration of the certificates that is **required** for a working Quinn connection. 
 
-As QUIC uses TLS 1.3 for authentication of connections, the server needs  to provide the client with a certificate confirming its identity, and the client must be configured to trust the certificates it receives from the server. 
+QUIC uses TLS 1.3 for authentication of connections, the server will have to provide the client with a certificate confirming its identity, 
+and the client must be configured to trust the certificates he receives from our server. 
 
 ## Insecure Connection
 
