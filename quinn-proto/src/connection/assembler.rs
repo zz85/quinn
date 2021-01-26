@@ -30,16 +30,8 @@ impl Assembler {
     }
 
     // Get the the next ordered chunk
-    pub(crate) fn read(
-        &mut self,
-        max_length: usize,
-        ordered: bool,
-    ) -> Result<Option<Chunk>, AssembleError> {
-        if self.is_stopped() {
-            return Err(AssembleError::UnknownStream);
-        } else if ordered && !self.state.is_ordered() {
-            return Err(AssembleError::IllegalOrderedRead);
-        } else if !ordered && self.state.is_ordered() {
+    pub(crate) fn read(&mut self, max_length: usize, ordered: bool) -> Option<Chunk> {
+        if !ordered && self.state.is_ordered() {
             // Enter unordered mode
             let mut recvd = RangeSet::new();
             recvd.insert(0..self.bytes_read);
@@ -49,43 +41,90 @@ impl Assembler {
             self.state = State::Unordered { recvd };
         }
 
+        let mut chunk = loop {
+            let state = Self::next(
+                ordered,
+                &mut self.data,
+                &mut self.bytes_read,
+                &mut self.defragmented,
+            );
+
+            use NextState::*;
+            match state {
+                Value(chunk) => break chunk,
+                Empty | Blocked => return None,
+                Retry => continue,
+            }
+        };
+
+        Some(if max_length < chunk.bytes.len() {
+            self.bytes_read += max_length as u64;
+            let offset = chunk.offset;
+            chunk.offset += max_length as u64;
+            Chunk::new(offset, chunk.bytes.split_to(max_length))
+        } else {
+            self.bytes_read += chunk.bytes.len() as u64;
+            self.defragmented = self.defragmented.saturating_sub(1);
+            let chunk = PeekMut::pop(chunk);
+            Chunk::new(chunk.offset, chunk.bytes)
+        })
+    }
+
+    pub(crate) fn can_read(&mut self, ordered: bool) -> Result<bool, AssembleError> {
+        if self.is_stopped() {
+            return Err(AssembleError::UnknownStream);
+        } else if ordered && !self.state.is_ordered() {
+            return Err(AssembleError::IllegalOrderedRead);
+        }
+
         loop {
-            let mut chunk = match self.data.peek_mut() {
-                Some(chunk) => chunk,
-                None => return Ok(None),
-            };
+            let state = Self::next(
+                ordered,
+                &mut self.data,
+                &mut self.bytes_read,
+                &mut self.defragmented,
+            );
 
-            if ordered {
-                if chunk.offset > self.bytes_read {
-                    // Next chunk is after current read index
-                    return Ok(None);
-                } else if (chunk.offset + chunk.bytes.len() as u64) <= self.bytes_read {
-                    // Next chunk is useless as the read index is beyond its end
-                    PeekMut::pop(chunk);
-                    self.defragmented = self.defragmented.saturating_sub(1);
-                    continue;
-                }
+            use NextState::*;
+            match state {
+                Value(_) => return Ok(true),
+                Empty | Blocked => return Ok(false),
+                Retry => continue,
+            }
+        }
+    }
 
-                // Determine `start` and `len` of the slice of useful data in chunk
-                let start = (self.bytes_read - chunk.offset) as usize;
-                if start > 0 {
-                    chunk.bytes.advance(start);
-                    chunk.offset += start as u64;
-                }
+    fn next<'a>(
+        ordered: bool,
+        data: &'a mut BinaryHeap<Buffer>,
+        bytes_read: &mut u64,
+        defragmented: &mut usize,
+    ) -> NextState<'a> {
+        let mut chunk = match data.peek_mut() {
+            Some(chunk) => chunk,
+            None => return NextState::Empty,
+        };
+
+        if ordered {
+            if chunk.offset > *bytes_read {
+                // Next chunk is after current read index
+                return NextState::Blocked;
+            } else if (chunk.offset + chunk.bytes.len() as u64) <= *bytes_read {
+                // Next chunk is useless as the read index is beyond its end
+                PeekMut::pop(chunk);
+                *defragmented = defragmented.saturating_sub(1);
+                return NextState::Retry;
             }
 
-            return Ok(Some(if max_length < chunk.bytes.len() {
-                self.bytes_read += max_length as u64;
-                let offset = chunk.offset;
-                chunk.offset += max_length as u64;
-                Chunk::new(offset, chunk.bytes.split_to(max_length))
-            } else {
-                self.bytes_read += chunk.bytes.len() as u64;
-                self.defragmented = self.defragmented.saturating_sub(1);
-                let chunk = PeekMut::pop(chunk);
-                Chunk::new(chunk.offset, chunk.bytes)
-            }));
+            // Determine `start` and `len` of the slice of useful data in chunk
+            let start = (*bytes_read - chunk.offset) as usize;
+            if start > 0 {
+                chunk.bytes.advance(start);
+                chunk.offset += start as u64;
+            }
         }
+
+        NextState::Value(chunk)
     }
 
     // Copy the buffered chunk data to new chunks backed by a single buffer to
@@ -203,6 +242,13 @@ impl Chunk {
     fn new(offset: u64, bytes: Bytes) -> Self {
         Chunk { offset, bytes }
     }
+}
+
+enum NextState<'a> {
+    Value(PeekMut<'a, Buffer>),
+    Blocked,
+    Retry,
+    Empty,
 }
 
 #[derive(Debug, Eq)]
@@ -452,14 +498,14 @@ mod test {
         x.insert(7, Bytes::from_static(b"hij"));
         x.insert(11, Bytes::from_static(b"lmn"));
         x.defragment();
-        assert_matches!(x.read(usize::MAX, true), Ok(Some(ref y)) if &y.bytes[..] == b"abcdef");
+        assert_matches!(x.read(usize::MAX, true), Some(ref y) if &y.bytes[..] == b"abcdef");
         x.insert(5, Bytes::from_static(b"fghijklmn"));
-        assert_matches!(x.read(usize::MAX, true), Ok(Some(ref y)) if &y.bytes[..] == b"ghijklmn");
+        assert_matches!(x.read(usize::MAX, true), Some(ref y) if &y.bytes[..] == b"ghijklmn");
         x.insert(13, Bytes::from_static(b"nopq"));
-        assert_matches!(x.read(usize::MAX, true), Ok(Some(ref y)) if &y.bytes[..] == b"opq");
+        assert_matches!(x.read(usize::MAX, true), Some(ref y) if &y.bytes[..] == b"opq");
         x.insert(15, Bytes::from_static(b"pqrs"));
-        assert_matches!(x.read(usize::MAX, true), Ok(Some(ref y)) if &y.bytes[..] == b"rs");
-        assert_matches!(x.read(usize::MAX, true), Ok(None));
+        assert_matches!(x.read(usize::MAX, true), Some(ref y) if &y.bytes[..] == b"rs");
+        assert_matches!(x.read(usize::MAX, true), None);
     }
 
     #[test]
@@ -470,13 +516,13 @@ mod test {
             next_unordered(&mut x),
             Chunk::new(0, Bytes::from_static(b"abc"))
         );
-        assert_eq!(x.read(usize::MAX, false).unwrap(), None);
+        assert_eq!(x.read(usize::MAX, false), None);
         x.insert(3, Bytes::from_static(b"def"));
         assert_eq!(
             next_unordered(&mut x),
             Chunk::new(3, Bytes::from_static(b"def"))
         );
-        assert_eq!(x.read(usize::MAX, false).unwrap(), None);
+        assert_eq!(x.read(usize::MAX, false), None);
     }
 
     #[test]
@@ -487,7 +533,7 @@ mod test {
             next_unordered(&mut x),
             Chunk::new(3, Bytes::from_static(b"def"))
         );
-        assert_eq!(x.read(usize::MAX, false).unwrap(), None);
+        assert_eq!(x.read(usize::MAX, false), None);
         x.insert(0, Bytes::from_static(b"a"));
         x.insert(0, Bytes::from_static(b"abcdefghi"));
         x.insert(0, Bytes::from_static(b"abcd"));
@@ -503,61 +549,62 @@ mod test {
             next_unordered(&mut x),
             Chunk::new(6, Bytes::from_static(b"ghi"))
         );
-        assert_eq!(x.read(usize::MAX, false).unwrap(), None);
+        assert_eq!(x.read(usize::MAX, false), None);
         x.insert(8, Bytes::from_static(b"ijkl"));
         assert_eq!(
             next_unordered(&mut x),
             Chunk::new(9, Bytes::from_static(b"jkl"))
         );
-        assert_eq!(x.read(usize::MAX, false).unwrap(), None);
+        assert_eq!(x.read(usize::MAX, false), None);
         x.insert(12, Bytes::from_static(b"mno"));
         assert_eq!(
             next_unordered(&mut x),
             Chunk::new(12, Bytes::from_static(b"mno"))
         );
-        assert_eq!(x.read(usize::MAX, false).unwrap(), None);
+        assert_eq!(x.read(usize::MAX, false), None);
         x.insert(2, Bytes::from_static(b"cde"));
-        assert_eq!(x.read(usize::MAX, false).unwrap(), None);
+        assert_eq!(x.read(usize::MAX, false), None);
     }
 
     #[test]
     fn chunks_dedup() {
         let mut x = Assembler::new();
         x.insert(3, Bytes::from_static(b"def"));
-        assert_eq!(x.read(usize::MAX, true).unwrap(), None);
+        assert_eq!(x.read(usize::MAX, true), None);
         x.insert(0, Bytes::from_static(b"a"));
         x.insert(1, Bytes::from_static(b"bcdefghi"));
         x.insert(0, Bytes::from_static(b"abcd"));
         assert_eq!(
-            x.read(usize::MAX, true).unwrap(),
+            x.read(usize::MAX, true),
             Some(Chunk::new(0, Bytes::from_static(b"abcd")))
         );
         assert_eq!(
-            x.read(usize::MAX, true).unwrap(),
+            x.read(usize::MAX, true),
             Some(Chunk::new(4, Bytes::from_static(b"efghi")))
         );
-        assert_eq!(x.read(usize::MAX, true).unwrap(), None);
+        assert_eq!(x.read(usize::MAX, true), None);
+
         x.insert(8, Bytes::from_static(b"ijkl"));
         assert_eq!(
-            x.read(usize::MAX, true).unwrap(),
+            x.read(usize::MAX, true),
             Some(Chunk::new(9, Bytes::from_static(b"jkl")))
         );
-        assert_eq!(x.read(usize::MAX, true).unwrap(), None);
+        assert_eq!(x.read(usize::MAX, true), None);
         x.insert(12, Bytes::from_static(b"mno"));
         assert_eq!(
-            x.read(usize::MAX, true).unwrap(),
+            x.read(usize::MAX, true),
             Some(Chunk::new(12, Bytes::from_static(b"mno")))
         );
-        assert_eq!(x.read(usize::MAX, true).unwrap(), None);
+        assert_eq!(x.read(usize::MAX, true), None);
         x.insert(2, Bytes::from_static(b"cde"));
-        assert_eq!(x.read(usize::MAX, true).unwrap(), None);
+        assert_eq!(x.read(usize::MAX, true), None);
     }
 
     fn next_unordered(x: &mut Assembler) -> Chunk {
-        x.read(usize::MAX, false).unwrap().unwrap()
+        x.read(usize::MAX, false).unwrap()
     }
 
     fn next(x: &mut Assembler, size: usize) -> Option<Bytes> {
-        x.read(size, true).unwrap().map(|chunk| chunk.bytes)
+        x.read(size, true).map(|chunk| chunk.bytes)
     }
 }
