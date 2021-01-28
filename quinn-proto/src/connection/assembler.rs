@@ -423,8 +423,14 @@ mod test {
         x.insert(9, Bytes::from_static(b"jkl"));
         x.insert(12, Bytes::from_static(b"mno"));
         x.defragment();
-        assert_eq!(next_unordered(&mut x), Chunk::new(0, Bytes::from_static(b"abcdef")));
-        assert_eq!(next_unordered(&mut x), Chunk::new(9, Bytes::from_static(b"jklmno")));
+        assert_eq!(
+            next_unordered(&mut x),
+            Chunk::new(0, Bytes::from_static(b"abcdef"))
+        );
+        assert_eq!(
+            next_unordered(&mut x),
+            Chunk::new(9, Bytes::from_static(b"jklmno"))
+        );
     }
 
     #[test]
@@ -432,7 +438,10 @@ mod test {
         let mut x = Assembler::new();
         x.insert(3, Bytes::from_static(b"def"));
         x.defragment();
-        assert_eq!(next_unordered(&mut x), Chunk::new(3, Bytes::from_static(b"def")));
+        assert_eq!(
+            next_unordered(&mut x),
+            Chunk::new(3, Bytes::from_static(b"def"))
+        );
     }
 
     #[test]
@@ -457,10 +466,16 @@ mod test {
     fn unordered_happy_path() {
         let mut x = Assembler::new();
         x.insert(0, Bytes::from_static(b"abc"));
-        assert_eq!(next_unordered(&mut x), Chunk::new(0, Bytes::from_static(b"abc")));
+        assert_eq!(
+            next_unordered(&mut x),
+            Chunk::new(0, Bytes::from_static(b"abc"))
+        );
         assert_eq!(x.read(usize::MAX, false).unwrap(), None);
         x.insert(3, Bytes::from_static(b"def"));
-        assert_eq!(next_unordered(&mut x), Chunk::new(3, Bytes::from_static(b"def")));
+        assert_eq!(
+            next_unordered(&mut x),
+            Chunk::new(3, Bytes::from_static(b"def"))
+        );
         assert_eq!(x.read(usize::MAX, false).unwrap(), None);
     }
 
@@ -468,20 +483,38 @@ mod test {
     fn unordered_dedup() {
         let mut x = Assembler::new();
         x.insert(3, Bytes::from_static(b"def"));
-        assert_eq!(next_unordered(&mut x), Chunk::new(3, Bytes::from_static(b"def")));
+        assert_eq!(
+            next_unordered(&mut x),
+            Chunk::new(3, Bytes::from_static(b"def"))
+        );
         assert_eq!(x.read(usize::MAX, false).unwrap(), None);
         x.insert(0, Bytes::from_static(b"a"));
         x.insert(0, Bytes::from_static(b"abcdefghi"));
         x.insert(0, Bytes::from_static(b"abcd"));
-        assert_eq!(next_unordered(&mut x), Chunk::new(0, Bytes::from_static(b"a")));
-        assert_eq!(next_unordered(&mut x), Chunk::new(1, Bytes::from_static(b"bc")));
-        assert_eq!(next_unordered(&mut x), Chunk::new(6, Bytes::from_static(b"ghi")));
+        assert_eq!(
+            next_unordered(&mut x),
+            Chunk::new(0, Bytes::from_static(b"a"))
+        );
+        assert_eq!(
+            next_unordered(&mut x),
+            Chunk::new(1, Bytes::from_static(b"bc"))
+        );
+        assert_eq!(
+            next_unordered(&mut x),
+            Chunk::new(6, Bytes::from_static(b"ghi"))
+        );
         assert_eq!(x.read(usize::MAX, false).unwrap(), None);
         x.insert(8, Bytes::from_static(b"ijkl"));
-        assert_eq!(next_unordered(&mut x), Chunk::new(9, Bytes::from_static(b"jkl")));
+        assert_eq!(
+            next_unordered(&mut x),
+            Chunk::new(9, Bytes::from_static(b"jkl"))
+        );
         assert_eq!(x.read(usize::MAX, false).unwrap(), None);
         x.insert(12, Bytes::from_static(b"mno"));
-        assert_eq!(next_unordered(&mut x), Chunk::new(12, Bytes::from_static(b"mno")));
+        assert_eq!(
+            next_unordered(&mut x),
+            Chunk::new(12, Bytes::from_static(b"mno"))
+        );
         assert_eq!(x.read(usize::MAX, false).unwrap(), None);
         x.insert(2, Bytes::from_static(b"cde"));
         assert_eq!(x.read(usize::MAX, false).unwrap(), None);
