@@ -360,18 +360,6 @@ where
         .map(|res| res.map(|_| ()))
     }
 
-    /// Read a segment of data from any offset in the stream.
-    ///
-    pub fn read_unordered(&mut self) -> ReadUnordered<'_, S> {
-        ReadUnordered { stream: self }
-    }
-
-    fn poll_read_unordered(&mut self, cx: &mut Context) -> Poll<Result<Option<Chunk>, ReadError>> {
-        self.poll_read_generic(cx, |conn, stream| {
-            conn.inner.read(stream, usize::MAX, false)
-        })
-    }
-
     /// Read the next segment of data
     ///
     /// Yields `None` if the stream was finished. Otherwise, yields a segment of data and its
@@ -535,7 +523,7 @@ where
     type Output = Result<Vec<u8>, ReadToEndError>;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         loop {
-            match ready!(self.stream.poll_read_unordered(cx))? {
+            match ready!(self.stream.poll_read_chunk(cx, usize::MAX, false))? {
                 Some(chunk) => {
                     self.start = self.start.min(chunk.offset);
                     let end = chunk.bytes.len() as u64 + chunk.offset;
@@ -785,26 +773,6 @@ pub enum ReadExactError {
     /// A read error occurred
     #[error("{0}")]
     ReadError(#[from] ReadError),
-}
-
-/// Future produced by [`RecvStream::read_unordered()`].
-///
-/// [`RecvStream::read_unordered()`]: crate::generic::RecvStream::read_unordered
-pub struct ReadUnordered<'a, S>
-where
-    S: proto::crypto::Session,
-{
-    stream: &'a mut RecvStream<S>,
-}
-
-impl<'a, S> Future for ReadUnordered<'a, S>
-where
-    S: proto::crypto::Session,
-{
-    type Output = Result<Option<Chunk>, ReadError>;
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        self.stream.poll_read_unordered(cx)
-    }
 }
 
 /// Future produced by [`RecvStream::read_chunk()`].
