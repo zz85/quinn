@@ -913,9 +913,12 @@ where
         max_length: usize,
         ordered: bool,
     ) -> Result<Option<Chunk>, ReadError> {
-        let result = self.streams.read(id, max_length, ordered);
-        self.post_read(id, &result);
-        Ok(result?.map(|x| x.result))
+        self.streams.read(
+            id,
+            max_length,
+            ordered,
+            &mut self.spaces[SpaceId::Data].pending,
+        )
     }
 
     /// Read the next ordered chunks from the given recv stream

@@ -21,7 +21,7 @@ use crate::{
 
 mod recv;
 pub use recv::ReadError;
-use recv::{BytesRead, ReadChunks, Recv, StreamReadResult};
+use recv::{BytesRead, Chunks, ReadChunks, Recv, StreamReadResult};
 pub(super) use recv::{DidRead, ReadResult};
 
 mod send;
@@ -207,8 +207,9 @@ impl Streams {
         id: StreamId,
         max_length: usize,
         ordered: bool,
-    ) -> ReadResult<Chunk> {
-        self.try_read(id, |rs| rs.read(max_length, ordered))
+        pending: &mut Retransmits,
+    ) -> Result<Option<Chunk>, ReadError> {
+        Chunks::new(id, ordered, self, pending)?.next(max_length)
     }
 
     pub(crate) fn read_chunks(
@@ -1077,6 +1078,7 @@ mod tests {
         let mut client = make(Side::Client);
         let id = StreamId::new(Side::Server, Dir::Uni, 0);
         let initial_max = client.local_max_data;
+        let mut pending = Retransmits::default();
         assert_eq!(
             client
                 .received(frame::Stream {
@@ -1090,7 +1092,7 @@ mod tests {
         );
         assert_eq!(client.data_recvd, 2048);
         assert_eq!(client.local_max_data - initial_max, 0);
-        client.read(id, 1024, true).unwrap();
+        client.read(id, 1024, true, &mut pending).unwrap();
         assert_eq!(client.local_max_data - initial_max, 1024);
         assert_eq!(
             client
@@ -1170,6 +1172,7 @@ mod tests {
     fn recv_stopped() {
         let mut client = make(Side::Client);
         let id = StreamId::new(Side::Server, Dir::Uni, 0);
+        let mut pending = Retransmits::default();
         let initial_max = client.local_max_data;
         assert_eq!(
             client
@@ -1191,9 +1194,12 @@ mod tests {
             }
         );
         assert!(client.stop(id).is_err());
-        assert_eq!(client.read(id, 0, true), Err(ReadError::UnknownStream));
         assert_eq!(
-            client.read(id, usize::MAX, false),
+            client.read(id, 0, true, &mut pending),
+            Err(ReadError::UnknownStream)
+        );
+        assert_eq!(
+            client.read(id, usize::MAX, false, &mut pending),
             Err(ReadError::UnknownStream)
         );
         assert_eq!(client.local_max_data - initial_max, 32);

@@ -1,8 +1,10 @@
+use std::collections::hash_map::Entry;
+
 use bytes::Bytes;
 use thiserror::Error;
 use tracing::debug;
 
-use super::{ShouldTransmit, UnknownStream};
+use super::{Retransmits, ShouldTransmit, StreamHalf, StreamId, Streams, UnknownStream};
 use crate::connection::assembler::{Assembler, Chunk, IllegalOrderedRead};
 use crate::{frame, TransportError, VarInt};
 
@@ -66,18 +68,6 @@ impl Recv {
         }
 
         Ok(new_bytes)
-    }
-
-    pub(super) fn read(&mut self, max_length: usize, ordered: bool) -> StreamReadResult<Chunk> {
-        if self.stopped {
-            return Err(ReadError::UnknownStream);
-        }
-
-        self.assembler.ensure_ordering(ordered)?;
-        match self.assembler.read(max_length, ordered) {
-            Some(chunk) => Ok(Some(chunk)),
-            None => self.read_blocked().map(|()| None),
-        }
     }
 
     pub(super) fn read_chunks(
@@ -257,6 +247,89 @@ impl Recv {
     }
 }
 
+pub struct Chunks<'a> {
+    id: StreamId,
+    ordered: bool,
+    streams: &'a mut Streams,
+    pending: &'a mut Retransmits,
+    recv: Option<Recv>,
+}
+
+impl<'a> Chunks<'a> {
+    pub(super) fn new(
+        id: StreamId,
+        ordered: bool,
+        streams: &'a mut Streams,
+        pending: &'a mut Retransmits,
+    ) -> Result<Self, ReadableError> {
+        let entry = match streams.recv.entry(id) {
+            Entry::Occupied(entry) => entry,
+            Entry::Vacant(_) => return Err(ReadableError::UnknownStream),
+        };
+
+        let mut recv = match entry.get().stopped {
+            true => return Err(ReadableError::UnknownStream),
+            false => entry.remove(),
+        };
+
+        recv.assembler.ensure_ordering(ordered)?;
+        Ok(Self {
+            id,
+            ordered,
+            streams,
+            pending,
+            recv: Some(recv),
+        })
+    }
+
+    pub(crate) fn next(&mut self, max_length: usize) -> Result<Option<Chunk>, ReadError> {
+        let mut rs = self.recv.take().unwrap();
+        if let Some(chunk) = rs.assembler.read(max_length, self.ordered) {
+            let (_, max_stream_data) = rs.max_stream_data(self.streams.stream_receive_window);
+            let max_data = self.streams.add_read_credits(chunk.bytes.len() as u64);
+            self.pending
+                .post_read(self.id, max_data, max_stream_data, false);
+            self.streams.recv.insert(self.id, rs);
+            return Ok(Some(chunk));
+        }
+
+        match rs.state {
+            RecvState::ResetRecvd { error_code, .. } => {
+                rs.state = RecvState::Closed;
+                self.streams.stream_freed(self.id, StreamHalf::Recv);
+                self.pending
+                    .post_read(self.id, ShouldTransmit(false), ShouldTransmit(false), true);
+                Err(ReadError::Reset(error_code))
+            }
+            RecvState::Closed => Err(ReadError::UnknownStream),
+            RecvState::Recv { size } => {
+                if size == Some(rs.end) && rs.assembler.bytes_read() == rs.end {
+                    rs.state = RecvState::Closed;
+                    self.streams.stream_freed(self.id, StreamHalf::Recv);
+                    self.pending.post_read(
+                        self.id,
+                        ShouldTransmit(false),
+                        ShouldTransmit(false),
+                        true,
+                    );
+                    Ok(None)
+                } else {
+                    self.streams.recv.insert(self.id, rs);
+                    Err(ReadError::Blocked)
+                }
+            }
+        }
+    }
+}
+
+impl<'a> Drop for Chunks<'a> {
+    fn drop(&mut self) {
+        if let Some(rs) = self.recv.take() {
+            self.streams.recv.insert(self.id, rs);
+        }
+    }
+}
+
 pub(crate) type ReadResult<T> = Result<Option<DidRead<T>>, ReadError>;
 
 /// Result of a `Streams::read` call in case the stream had not ended yet
@@ -316,9 +389,38 @@ pub enum ReadError {
     IllegalOrderedRead,
 }
 
+impl From<ReadableError> for ReadError {
+    fn from(e: ReadableError) -> Self {
+        match e {
+            ReadableError::UnknownStream => ReadError::UnknownStream,
+            ReadableError::IllegalOrderedRead => ReadError::IllegalOrderedRead,
+        }
+    }
+}
+
 impl From<IllegalOrderedRead> for ReadError {
     fn from(_: IllegalOrderedRead) -> Self {
         ReadError::IllegalOrderedRead
+    }
+}
+
+/// Errors triggered when opening a recv stream for reading
+#[derive(Debug, Error, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum ReadableError {
+    /// The stream has not been opened or was already stopped, finished, or reset
+    #[error("unknown stream")]
+    UnknownStream,
+    /// Attempted an ordered read following an unordered read
+    ///
+    /// Performing an unordered read allows discontinuities to arise in the receive buffer of a
+    /// stream which cannot be recovered, making further ordered reads impossible.
+    #[error("ordered read after unordered read")]
+    IllegalOrderedRead,
+}
+
+impl From<IllegalOrderedRead> for ReadableError {
+    fn from(_: IllegalOrderedRead) -> Self {
+        ReadableError::IllegalOrderedRead
     }
 }
 
