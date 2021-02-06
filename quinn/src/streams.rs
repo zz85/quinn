@@ -11,7 +11,7 @@ use futures::{
     io::{AsyncRead, AsyncWrite},
     ready, FutureExt,
 };
-use proto::{Chunk, ConnectionError, FinishError, StreamId};
+use proto::{Chunk, Chunks, ConnectionError, FinishError, ReadableError, StreamId};
 use thiserror::Error;
 use tokio::io::ReadBuf;
 
@@ -319,6 +319,7 @@ where
     stream: StreamId,
     is_0rtt: bool,
     all_data_read: bool,
+    error: Option<proto::ReadError>,
 }
 
 impl<S> RecvStream<S>
@@ -331,6 +332,7 @@ where
             stream,
             is_0rtt,
             all_data_read: false,
+            error: None,
         }
     }
 
@@ -371,10 +373,31 @@ where
         cx: &mut Context,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<Result<(), ReadError>> {
-        self.poll_read_generic(cx, |conn, stream| {
-            conn.inner
-                .read(stream, buf.remaining(), true)
-                .map(|val| val.map(|chunk| buf.put_slice(&chunk.bytes)))
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        self.poll_read_generic(cx, true, |chunks, error| {
+            let mut read = false;
+            loop {
+                if buf.remaining() == 0 {
+                    return Ok(Some(()));
+                }
+
+                match chunks.next(buf.remaining()) {
+                    Ok(Some(chunk)) => {
+                        buf.put_slice(&chunk.bytes);
+                        read = true;
+                    }
+                    Ok(None) if read => return Ok(Some(())),
+                    Err(err) if read => {
+                        *error = Some(err);
+                        return Ok(Some(()));
+                    }
+                    Ok(None) => return Ok(None),
+                    Err(err) => return Err(err),
+                }
+            }
         })
         .map(|res| res.map(|_| ()))
     }
@@ -405,9 +428,7 @@ where
         max_length: usize,
         ordered: bool,
     ) -> Poll<Result<Option<Chunk>, ReadError>> {
-        self.poll_read_generic(cx, |conn, stream| {
-            conn.inner.read(stream, max_length, ordered)
-        })
+        self.poll_read_generic(cx, ordered, |chunks, _| chunks.next(max_length))
     }
 
     /// Read the next segments of data
@@ -428,7 +449,35 @@ where
         cx: &mut Context,
         bufs: &mut [Bytes],
     ) -> Poll<Result<Option<usize>, ReadError>> {
-        self.poll_read_generic(cx, |conn, stream| conn.inner.read_chunks(stream, bufs))
+        if bufs.is_empty() {
+            return Poll::Ready(Ok(Some(0)));
+        }
+
+        self.poll_read_generic(cx, true, |chunks, error| {
+            let mut read = 0;
+            loop {
+                if read >= bufs.len() {
+                    return match read {
+                        0 => Ok(Some(0)),
+                        n => Ok(Some(n)),
+                    };
+                }
+
+                match chunks.next(usize::MAX) {
+                    Ok(Some(chunk)) => {
+                        bufs[read] = chunk.bytes;
+                        read += 1;
+                    }
+                    Ok(None) if read > 0 => return Ok(Some(read)),
+                    Ok(None) => return Ok(None),
+                    Err(err) if read > 0 => {
+                        *error = Some(err);
+                        return Ok(Some(read));
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        })
     }
 
     /// Convenience method to read all remaining data into a buffer
@@ -482,22 +531,30 @@ where
     fn poll_read_generic<T, U>(
         &mut self,
         cx: &mut Context,
+        ordered: bool,
         mut read_fn: T,
     ) -> Poll<Result<Option<U>, ReadError>>
     where
-        T: FnMut(
-            &mut crate::connection::ConnectionInner<S>,
-            StreamId,
-        ) -> Result<Option<U>, proto::ReadError>,
+        T: FnMut(&mut Chunks, &mut Option<proto::ReadError>) -> Result<Option<U>, proto::ReadError>,
     {
         use proto::ReadError::*;
         let mut conn = self.conn.lock().unwrap();
         if self.is_0rtt {
             conn.check_0rtt().map_err(|()| ReadError::ZeroRttRejected)?;
         }
-        match read_fn(&mut conn, self.stream) {
+
+        let (result, should_transmit) = match self.error.take() {
+            Some(err) => (Err(err), false),
+            None => {
+                let mut chunks = conn.inner.read(self.stream, ordered)?;
+                let result = read_fn(&mut chunks, &mut self.error);
+                (result, chunks.finalize().should_transmit())
+            }
+        };
+
+        match result {
             Ok(Some(u)) => {
-                if conn.inner.has_pending_retransmits() {
+                if should_transmit {
                     conn.wake()
                 }
                 Poll::Ready(Ok(Some(u)))
@@ -518,7 +575,6 @@ where
                 Poll::Ready(Err(ReadError::Reset(error_code)))
             }
             Err(UnknownStream) => Poll::Ready(Err(ReadError::UnknownStream)),
-            Err(IllegalOrderedRead) => Poll::Ready(Err(ReadError::IllegalOrderedRead)),
         }
     }
 }
@@ -659,6 +715,15 @@ pub enum ReadError {
     /// [`Connecting::into_0rtt()`]: crate::generic::Connecting::into_0rtt()
     #[error("0-RTT rejected")]
     ZeroRttRejected,
+}
+
+impl From<ReadableError> for ReadError {
+    fn from(e: ReadableError) -> Self {
+        match e {
+            ReadableError::UnknownStream => ReadError::UnknownStream,
+            ReadableError::IllegalOrderedRead => ReadError::IllegalOrderedRead,
+        }
+    }
 }
 
 impl From<ReadError> for io::Error {
